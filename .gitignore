@@ -35,6 +35,7 @@ wheels/
 *.pth
 *.onnx
 checkpoints/
+videos/
 runs/
 logs/
 
