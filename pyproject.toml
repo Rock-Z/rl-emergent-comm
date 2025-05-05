@@ -1,0 +1,25 @@
+[project]
+name = "rl-emergent-comm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = [
+    "certifi>=2025.4.26",
+    "egg",
+    "gymnasium>=0.28.1",
+    "ipykernel>=6.16.2",
+    "matplotlib>=3.5.3",
+    "minigrid>=3.0.0",
+    "pip>=24.0",
+    "torch==1.6.0",
+    "torchvision==0.7.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "ipykernel>=6.16.2",
+]
+
+[tool.uv.sources]
+egg = { path = "EGG", editable = true }
