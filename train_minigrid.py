@@ -17,18 +17,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def make_env(video_folder=None, episode_trigger=None):
     # Initialize environment with rgb_array render_mode for video recording
-    env = gym.make("MiniGrid-Empty-6x6-v0", render_mode="rgb_array")
+    env = gym.make("MiniGrid-Empty-Random-6x6-v0", render_mode="rgb_array")
     if video_folder:
         env = RecordVideo(env, video_folder=video_folder, episode_trigger=episode_trigger, name_prefix="gameplay")
     env = RGBImgPartialObsWrapper(env, tile_size=8) # Get RGB image obs
-    env = ImgObsWrapper(env) # Get rid of the Dict observation space
+    # Remove ImgObsWrapper to keep the dictionary observation space
+    # env = ImgObsWrapper(env)
     env = RecordEpisodeStatistics(env) # Records episode statistics
     return env
 
 class RNNAgent(nn.Module):
-    def __init__(self, input_shape, num_actions, hidden_size=64):
+    def __init__(self, obs_space, num_actions, hidden_size=64, direction_embed_size=8):
         super(RNNAgent, self).__init__()
         
+        image_shape = obs_space['image'].shape
+        # Direction is encoded as an integer 0-3
+        num_directions = 4 
+        self.direction_embed_size = direction_embed_size
+
         self.conv = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -42,18 +48,23 @@ class RNNAgent(nn.Module):
             nn.Flatten()
         )
         
-        conv_out_size = self._get_conv_output(input_shape)
+        conv_out_size = self._get_conv_output(image_shape)
         
-        self.rnn = nn.GRUCell(conv_out_size, hidden_size)
+        # Embedding layer for direction
+        self.direction_embedding = nn.Embedding(num_directions, direction_embed_size)
+
+        # RNN input size is CNN output + direction embedding
+        rnn_input_size = conv_out_size + direction_embed_size
+        self.rnn = nn.GRUCell(rnn_input_size, hidden_size)
         
         self.actor = nn.Linear(hidden_size, num_actions)
         self.critic = nn.Linear(hidden_size, 1)
         
         self.hidden = None
         
-    def _get_conv_output(self, shape):
+    def _get_conv_output(self, image_shape):
         # Permute shape to (channels, height, width) for PyTorch
-        shape = (shape[2], shape[0], shape[1])
+        shape = (image_shape[2], image_shape[0], image_shape[1])
         x = torch.zeros(1, *shape)
         x = self.conv(x)
         return x.size(1)
@@ -61,45 +72,51 @@ class RNNAgent(nn.Module):
     def reset_hidden(self, batch_size=1):
         self.hidden = torch.zeros(batch_size, 64, device=device)
         
-    def forward(self, x): # Input shape: (batch, H, W, C) or (T, 1, H, W, C)
-        is_sequence = x.dim() == 5
+    def forward(self, obs_dict): # Input is now a dictionary
+        # Extract image and direction
+        img = obs_dict['image'] # Shape: (batch/T, H, W, C) or (T, 1, H, W, C)
+        direction = obs_dict['direction'] # Shape: (batch/T,) or (T, 1)
+
+        is_sequence = img.dim() == 5
 
         if is_sequence:
-            T = x.shape[0]
-            x = x.squeeze(1) # Squeeze batch dim: (T, H, W, C)
+            T = img.shape[0]
+            img = img.squeeze(1) # Squeeze batch dim: (T, H, W, C)
+            direction = direction.squeeze(1) # Squeeze batch dim: (T,)
         else:
             T = 1 # Treat as sequence of length 1
 
-        # Normalize and permute for CNN: (T or batch, C, H, W)
-        x = x / 255.0
-        x = x.permute(0, 3, 1, 2)
+        # --- Process Image --- 
+        img = img / 255.0
+        img = img.permute(0, 3, 1, 2) # (T or batch, C, H, W)
+        conv_out = self.conv(img) # (T or batch, conv_out_size)
 
-        conv_out = self.conv(x)
+        # --- Process Direction --- 
+        direction_embedded = self.direction_embedding(direction) # (T or batch, direction_embed_size)
 
-        # Process sequence with RNN
+        # --- Combine Features --- 
+        combined_features = torch.cat((conv_out, direction_embedded), dim=1) # (T or batch, rnn_input_size)
+
+        # --- Process with RNN --- 
         if is_sequence:
-            # Training phase: process sequence step-by-step
-            hidden_state = torch.zeros(1, 64, device=device) # Local hidden state for sequence
+            hidden_state = torch.zeros(1, 64, device=device)
             outputs = []
             for t in range(T):
-                rnn_input = conv_out[t].unsqueeze(0)
+                rnn_input = combined_features[t].unsqueeze(0)
                 hidden_state = self.rnn(rnn_input, hidden_state)
                 outputs.append(hidden_state)
-            rnn_output = torch.stack(outputs).squeeze(1) # (T, hidden_size)
+            rnn_output = torch.stack(outputs).squeeze(1)
         else:
-            # Rollout phase: use persistent hidden state
-            batch_size = conv_out.size(0)
+            batch_size = combined_features.size(0)
             if self.hidden is None or self.hidden.size(0) != batch_size:
                 self.reset_hidden(batch_size)
-            self.hidden = self.rnn(conv_out, self.hidden)
-            rnn_output = self.hidden # (1, hidden_size)
+            self.hidden = self.rnn(combined_features, self.hidden)
+            rnn_output = self.hidden
 
         policy_logits = self.actor(rnn_output)
         values = self.critic(rnn_output)
 
         policy = F.softmax(policy_logits, dim=-1)
-
-        # Return policy probs and state values
         return policy, values.squeeze(-1)
 
 def compute_returns(rewards, masks, gamma=0.99):
@@ -110,13 +127,20 @@ def compute_returns(rewards, masks, gamma=0.99):
         returns.insert(0, R)
     return returns
 
-def train(agent, optimizer, states, actions, returns, values, entropy_coef=0.01):
-    states = torch.stack(states)
+def train(agent, optimizer, states_dicts, actions, returns, values, entropy_coef=0.01):
+    # Process the list of state dictionaries
+    images = torch.stack([torch.FloatTensor(s['image']).to(device) for s in states_dicts])
+    directions = torch.tensor([s['direction'] for s in states_dicts], dtype=torch.long, device=device)
+    
+    # Create input dictionary for the agent
+    obs_input = {'image': images, 'direction': directions}
+
     actions = torch.tensor(actions, dtype=torch.long, device=device)
     returns = torch.tensor(returns, dtype=torch.float, device=device)
     values = torch.tensor(values, dtype=torch.float, device=device).squeeze()
     
-    logits, _ = agent(states)
+    # Note: agent expects dictionary input now
+    logits, _ = agent(obs_input)
     dist = Categorical(logits)
     log_probs = dist.log_prob(actions)
     entropy = dist.entropy().mean()
@@ -126,7 +150,6 @@ def train(agent, optimizer, states, actions, returns, values, entropy_coef=0.01)
     policy_loss = -(log_probs * advantage.detach()).mean()
     value_loss = F.mse_loss(values, returns)
     
-    # Total loss: policy gradient + value loss - entropy bonus
     loss = policy_loss + 0.5 * value_loss - entropy_coef * entropy
     
     optimizer.zero_grad()
@@ -137,24 +160,28 @@ def train(agent, optimizer, states, actions, returns, values, entropy_coef=0.01)
 
 def run_recorded_episode(agent, video_folder, episode_num):
     print(f"Recording episode {episode_num}...")
-    # Create env with video recording enabled for this specific episode
-    rec_env = make_env(video_folder=video_folder, episode_trigger=lambda x: x == 0) # Record only the first episode (index 0)
+    rec_env = make_env(video_folder=video_folder, episode_trigger=lambda x: x == 0)
     
-    state, _ = rec_env.reset()
-    agent.reset_hidden() # Reset agent's hidden state for the recording
+    state_dict, _ = rec_env.reset()
+    agent.reset_hidden()
     done = False
     episode_reward = 0.0
 
     while not done:
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        # Prepare dictionary input for agent
+        img_tensor = torch.FloatTensor(state_dict['image']).unsqueeze(0).to(device)
+        dir_tensor = torch.tensor([state_dict['direction']], dtype=torch.long, device=device)
+        obs_input = {'image': img_tensor, 'direction': dir_tensor}
+
         with torch.no_grad():
-            policy, _ = agent(state_tensor)
+            # Agent takes dictionary input
+            policy, _ = agent(obs_input)
             dist = Categorical(policy)
             action = dist.sample()
         
-        next_state, reward, terminated, truncated, _ = rec_env.step(action.item())
+        next_state_dict, reward, terminated, truncated, _ = rec_env.step(action.item())
         done = terminated or truncated
-        state = next_state
+        state_dict = next_state_dict
         episode_reward += reward
 
     rec_env.close()
@@ -174,9 +201,10 @@ def main():
     
     env = make_env()
     
-    input_shape = env.observation_space.shape
+    # Pass the observation space dictionary to the agent
+    obs_space = env.observation_space
     num_actions = env.action_space.n
-    agent = RNNAgent(input_shape, num_actions).to(device)
+    agent = RNNAgent(obs_space, num_actions).to(device)
     
     optimizer = optim.Adam(agent.parameters(), lr=args.lr)
     
@@ -184,43 +212,48 @@ def main():
     episode_rewards = []
     
     for episode in range(1, args.num_episodes + 1):
-        state, _ = env.reset()
+        state_dict, _ = env.reset() # Now returns a dictionary
         agent.reset_hidden()
         
         done = False
         episode_reward = 0.0
         
-        # Store trajectory data for this episode
-        states = []
+        states_dicts = [] # Store state dictionaries
         actions = []
         rewards = []
         values = []
         masks = []
         
         while not done:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            
+            # Prepare dictionary input for agent
+            img_tensor = torch.FloatTensor(state_dict['image']).unsqueeze(0).to(device)
+            dir_tensor = torch.tensor([state_dict['direction']], dtype=torch.long, device=device)
+            obs_input = {'image': img_tensor, 'direction': dir_tensor}
+
             with torch.no_grad():
-                policy, value = agent(state_tensor)
+                # Agent takes dictionary input
+                policy, value = agent(obs_input)
                 dist = Categorical(policy)
                 action = dist.sample()
             
-            next_state, reward, terminated, truncated, _ = env.step(action.item())
+            next_state_dict, reward, terminated, truncated, _ = env.step(action.item())
             done = terminated or truncated
             
-            states.append(state_tensor)
+            # Store the full state dictionary
+            states_dicts.append(state_dict)
             actions.append(action.item())
             rewards.append(reward)
             values.append(value.item())
             masks.append(1 - done)
             
-            state = next_state
+            state_dict = next_state_dict
             episode_reward += reward
             total_steps += 1
         
         returns = compute_returns(rewards, masks, gamma=args.gamma)
         
-        loss = train(agent, optimizer, states, actions, returns, values, entropy_coef=args.entropy_coef)
+        # Pass list of state dictionaries to train function
+        loss = train(agent, optimizer, states_dicts, actions, returns, values, entropy_coef=args.entropy_coef)
         
         episode_rewards.append(episode_reward)
         
