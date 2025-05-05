@@ -17,7 +17,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def make_env(video_folder=None, episode_trigger=None):
     # Initialize environment with rgb_array render_mode for video recording
-    env = gym.make("MiniGrid-Empty-Random-6x6-v0", render_mode="rgb_array")
+    env = gym.make("MiniGrid-Empty-16x16-v0", render_mode="rgb_array")
     if video_folder:
         env = RecordVideo(env, video_folder=video_folder, episode_trigger=episode_trigger, name_prefix="gameplay")
     env = RGBImgPartialObsWrapper(env, tile_size=8) # Get RGB image obs
@@ -36,15 +36,11 @@ class RNNAgent(nn.Module):
         self.direction_embed_size = direction_embed_size
 
         self.conv = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(3, 32, kernel_size=7, stride=3),
             nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(32, 64, kernel_size=7, stride=3),
             nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.Flatten()
         )
         
@@ -189,8 +185,8 @@ def run_recorded_episode(agent, video_folder, episode_num):
 
 def main():
     parser = argparse.ArgumentParser(description="RNN Policy Gradient for MiniGrid")
-    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=0.9, help="Discount factor")
     parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy coefficient")
     parser.add_argument("--num-episodes", type=int, default=10000, help="Number of episodes")
     parser.add_argument("--checkpoint-interval", type=int, default=100, help="Checkpoint interval")

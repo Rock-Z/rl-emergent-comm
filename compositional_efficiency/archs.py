@@ -44,7 +44,7 @@ class IdentitySender(nn.Module):
         batch_size = x.size(0)
 
         message = x
-        assert message.size(1) == 2
+        assert message.dim() == 2 and message.size(1) == self.n_attributes
 
         zeros = torch.zeros(message.size(0), message.size(1), device=x.device)
         return message + 1, zeros, zeros
@@ -65,7 +65,7 @@ class RotatedSender(nn.Module):
             message[:, 1] = (self.n_values + x[:, 0] -
                              x[:, 1]).fmod(self.n_values)
         else:
-            assert False
+            assert False, "RotatedSender currently only supports n_attributes=2"
 
         assert message.size(1) == 2
         zeros = torch.zeros(message.size(0), message.size(1), device=x.device)
