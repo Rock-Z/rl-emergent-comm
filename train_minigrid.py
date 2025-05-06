@@ -63,7 +63,7 @@ def make_env(video_folder=None, episode_trigger=None):
     env = gym.make("MiniGrid-Empty-Random-10x10-v0", render_mode="rgb_array")
     if video_folder:
         env = RecordVideo(env, video_folder=video_folder, episode_trigger=episode_trigger, name_prefix="gameplay")
-    env = RGBImgPartialObsWrapper(env, tile_size=8) # Get RGB image obs
+    #env = RGBImgPartialObsWrapper(env, tile_size=8) # Get RGB image obs
     env = RecordEpisodeStatistics(env) # Records episode statistics
     return env
 
@@ -77,11 +77,10 @@ class RNNAgent(nn.Module):
         self.direction_embed_size = direction_embed_size
 
         self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=7, stride=3),
+            nn.Conv2d(3, 32, kernel_size=3, stride=2),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=7, stride=3),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.Flatten()
         )
         
@@ -185,7 +184,7 @@ def train(agent, optimizer, states_dicts, actions, returns, values, entropy_coef
     advantage = returns - values
     
     policy_loss = -(log_probs * advantage.detach()).mean()
-    value_loss = F.mse_loss(values, returns)
+    value_loss = F.mse_loss(values.view(-1), returns.view(-1))
     
     loss = policy_loss + 0.5 * value_loss - entropy_coef * entropy
     
