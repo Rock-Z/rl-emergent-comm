@@ -2,8 +2,8 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-import torch.nn.functional as F # Added import
 from torch.distributions import Categorical
 from torch.utils.data import DataLoader
 
@@ -13,6 +13,107 @@ from compositional_efficiency.archs import IdentitySender, RotatedSender
 
 # Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Learned Sender Model ---
+class RnnSender(nn.Module):
+    def __init__(self, n_attributes, n_values, vocab_size, embed_dim, hidden_size, cell='gru', max_len=2):
+        super().__init__()
+        self.n_attributes = n_attributes
+        self.n_values = n_values
+        self.input_dim = n_attributes * n_values # Input is flattened one-hot
+        self.vocab_size = vocab_size # Output vocab size (n_values + 1 for EOS/padding)
+        self.embed_dim = embed_dim # Embedding for output symbols (used as input to RNN step)
+        self.hidden_size = hidden_size
+        self.max_len = max_len # Fixed message length
+
+        # Layer to get initial hidden state from flattened one-hot input
+        self.input_to_hidden = nn.Linear(self.input_dim, hidden_size)
+
+        # Embedding for the output symbols (used as input during generation)
+        # vocab_size needs to account for symbols 1..n_values and potentially 0 (SOS/PAD)
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+        # RNN cell
+        rnn_cell_type = nn.GRUCell if cell.lower() == 'gru' else \
+                        nn.LSTMCell if cell.lower() == 'lstm' else \
+                        nn.RNNCell
+        self.rnn_cell = rnn_cell_type(embed_dim, hidden_size)
+        self.is_lstm = isinstance(self.rnn_cell, nn.LSTMCell)
+
+        # Output layer from hidden state to vocab logits
+        self.hidden_to_output = nn.Linear(hidden_size, vocab_size)
+
+        # Learned start-of-sequence symbol embedding (using index 0)
+        # We don't use a separate parameter but use index 0 of the embedding table
+        # self.sos_embedding = nn.Parameter(torch.randn(1, embed_dim))
+
+    def forward(self, x):
+        """
+        Input x: (batch_size, n_attributes) tensor of attribute values (0 to n_values-1)
+        Output message: (batch_size, max_len) tensor of symbols (1 to n_values)
+        Output log_probs: (batch_size, max_len) tensor of log probabilities for the chosen symbols
+        Output entropy: (batch_size, max_len) tensor of entropy for the distributions at each step
+        """
+        batch_size = x.size(0)
+        device = x.device
+
+        # 1. Convert input attributes to one-hot and get initial hidden state
+        x_one_hot = F.one_hot(x, num_classes=self.n_values).view(batch_size, -1).float()
+        h = self.input_to_hidden(x_one_hot) # (batch_size, hidden_size)
+        c = torch.zeros_like(h) if self.is_lstm else None # Initial cell state for LSTM
+
+        # 2. Generate sequence step-by-step
+        messages = []
+        log_probs = []
+        entropies = []
+
+        # Initial input embedding: Use embedding of index 0 as SOS symbol
+        step_input_emb = self.embedding(torch.zeros(batch_size, dtype=torch.long, device=device))
+
+        for _ in range(self.max_len):
+            # Run RNN cell
+            if self.is_lstm:
+                h, c = self.rnn_cell(step_input_emb, (h, c))
+            else:
+                h = self.rnn_cell(step_input_emb, h)
+
+            # Get logits over vocabulary
+            step_logits = self.hidden_to_output(h) # (batch_size, vocab_size)
+
+            # Mask the logit for index 0 (SOS/PAD symbol) to prevent sampling it
+            # Set its logit to a very large negative number
+            masked_logits = step_logits.clone()
+            masked_logits[:, 0] = -float('inf')
+
+            # Sample symbol (use Categorical distribution with masked logits)
+            dist = Categorical(logits=masked_logits)
+            symbol = dist.sample() # (batch_size,)
+
+            # Store results using the original (unmasked) distribution for correct log_prob and entropy
+            # Calculate log_prob and entropy based on the *original* logits
+            original_dist = Categorical(logits=step_logits)
+            log_prob_for_symbol = original_dist.log_prob(symbol)
+            entropy_for_step = original_dist.entropy()
+
+            messages.append(symbol)
+            log_probs.append(log_prob_for_symbol)
+            entropies.append(entropy_for_step)
+
+            # Prepare input embedding for next step (use embedding of the generated symbol)
+            step_input_emb = self.embedding(symbol) # symbol is already in [1, vocab_size-1]
+
+        # Stack results into tensors
+        message_tensor = torch.stack(messages, dim=1) # (batch_size, max_len)
+        log_prob_tensor = torch.stack(log_probs, dim=1) # (batch_size, max_len)
+        entropy_tensor = torch.stack(entropies, dim=1) # (batch_size, max_len)
+
+        # The message tensor now naturally contains symbols >= 1 because 0 was masked.
+        # No need for clamping anymore.
+        # message_output_tensor = message_tensor.clamp(min=1)
+
+        # Return the generated message, log_probs and entropies.
+        return message_tensor, log_prob_tensor, entropy_tensor
+
 
 # --- Receiver Model (Agent Wrapper) ---
 class RnnReceiver(nn.Module):
@@ -75,54 +176,99 @@ class RnnReceiver(nn.Module):
         return [output_logits_per_attribute[:, i, :] for i in range(self.n_attributes)]
 
 
-# --- REINFORCE Training Function (for Receiver) ---
-def train_receiver(receiver, optimizer, messages, target_attributes, receiver_actions, rewards, entropy_coef=0.01):
+# --- Unified Training Step Function ---
+def train_step(sender, receiver, sender_optimizer, receiver_optimizer,
+               input_attributes,
+               receiver_actions_tensor, rewards,
+               sender_entropy_coef, receiver_entropy_coef, grad_norm,
+               train_sender_flag):
     """
-    Trains the Receiver using REINFORCE.
-    messages: (batch_size, n_attributes) - Message symbols from sender
-    target_attributes: (batch_size, n_attributes) - The original attributes
-    receiver_actions: (batch_size, n_attributes) - The attributes predicted by the receiver (sampled)
-    rewards: (batch_size,) - Scalar reward (1 if all attributes match, 0 otherwise)
+    Performs one training step for Receiver and optionally Sender using REINFORCE.
+    Generates the message within this step.
+    Returns losses and the generated message details.
     """
-    # Forward pass to get current action probabilities
-    prediction_logits = receiver(messages)
+    receiver_loss_val, receiver_pol_loss_val, receiver_ent_loss_val = 0.0, 0.0, 0.0
+    sender_loss_val, sender_pol_loss_val, sender_ent_loss_val = 0.0, 0.0, 0.0
+
+    # --- Interaction: Sender produces message ---
+    # Set sender mode based on whether it's being trained
+    if not train_sender_flag:
+        sender.eval()
+        with torch.no_grad(): # Ensure no grads for fixed sender forward pass
+             messages, sender_log_probs, sender_entropies = sender(input_attributes)
+    else:
+        sender.train() # Ensure sender is in train mode for gradient calculation
+        messages, sender_log_probs, sender_entropies = sender(input_attributes)
+
+    # --- Train Receiver ---
+    receiver.train()
+    # Detach messages before feeding to receiver to prevent grads flowing back
+    # through message generation during receiver optimization step.
+    prediction_logits = receiver(messages.detach())
 
     log_probs = []
     entropies = []
     for i in range(receiver.n_attributes):
         dist = Categorical(logits=prediction_logits[i])
-        log_prob = dist.log_prob(receiver_actions[:, i]) # Log prob of the action *taken*
+        log_prob = dist.log_prob(receiver_actions_tensor[:, i]) # Log prob of the action *taken*
         entropy = dist.entropy()
         log_probs.append(log_prob)
         entropies.append(entropy)
 
     # Sum log probs across attributes for the joint action probability
-    total_log_prob = torch.stack(log_probs, dim=1).sum(dim=1) # (batch_size,)
+    receiver_total_log_prob = torch.stack(log_probs, dim=1).sum(dim=1) # (batch_size,)
     # Average entropy over attributes
-    total_entropy = torch.stack(entropies, dim=1).mean(dim=1) # (batch_size,)
+    receiver_total_entropy = torch.stack(entropies, dim=1).mean(dim=1) # (batch_size,)
 
-    # Calculate policy loss (REINFORCE)
     # Normalize rewards (optional but often helpful, especially with sparse rewards)
-    if rewards.std() > 1e-6: # Avoid division by zero if all rewards are the same
-         rewards = (rewards - rewards.mean()) / rewards.std()
-    else:
-         rewards = rewards - rewards.mean() # Just center if std is zero
+    # if rewards.std() > 1e-6: # Avoid division by zero if all rewards are the same
+    #      rewards = (rewards - rewards.mean()) / rewards.std()
+    # else:
+    #      rewards = rewards - rewards.mean() # Just center if std is zero
 
-    policy_loss = -(total_log_prob * rewards).mean()
+    receiver_policy_loss = -(receiver_total_log_prob * rewards).mean()
+    receiver_entropy_loss = -receiver_total_entropy.mean()
+    receiver_loss = receiver_policy_loss + receiver_entropy_coef * receiver_entropy_loss
 
-    # Calculate entropy loss (negative entropy, minimized)
-    entropy_loss = -total_entropy.mean()
+    receiver_optimizer.zero_grad()
+    receiver_loss.backward()
+    torch.nn.utils.clip_grad_norm_(receiver.parameters(), max_norm=grad_norm)
+    receiver_optimizer.step()
 
-    # Total loss
-    loss = policy_loss + entropy_coef * entropy_loss
+    receiver_loss_val = receiver_loss.item()
+    receiver_pol_loss_val = receiver_policy_loss.item()
+    receiver_ent_loss_val = receiver_entropy_loss.item()
 
-    # Optimize Receiver
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(receiver.parameters(), max_norm=1.0)
-    optimizer.step()
+    # --- Train Sender (if learned) ---
+    if train_sender_flag:
+        # sender is already in train() mode from message generation above
+        # Calculate sender loss components using REINFORCE
+        # sender_log_probs and sender_entropies were calculated during the forward pass
+        sender_total_log_prob = sender_log_probs.sum(dim=1) # (batch_size,)
+        sender_total_entropy = sender_entropies.mean(dim=1) # (batch_size,)
 
-    return loss.item(), policy_loss.item(), entropy_loss.item()
+        # Use the same normalized rewards as the receiver
+        # norm_rewards calculated above
+
+        sender_policy_loss = -(sender_total_log_prob * rewards).mean()
+        sender_entropy_loss = -sender_total_entropy.mean()
+        sender_loss = sender_policy_loss + sender_entropy_coef * sender_entropy_loss
+
+        # Optimize Sender
+        sender_optimizer.zero_grad()
+        sender_loss.backward()
+        torch.nn.utils.clip_grad_norm_(sender.parameters(), max_norm=grad_norm)
+        sender_optimizer.step()
+
+        sender_loss_val = sender_loss.item()
+        sender_pol_loss_val = sender_policy_loss.item()
+        sender_ent_loss_val = sender_entropy_loss.item()
+
+    # Return losses AND message details (needed for receiver action sampling in main loop)
+    return (receiver_loss_val, receiver_pol_loss_val, receiver_ent_loss_val,
+            sender_loss_val, sender_pol_loss_val, sender_ent_loss_val,
+            messages, sender_log_probs, sender_entropies)
+
 
 # --- Evaluation Function ---
 def evaluate_communication(sender, receiver, data_loader):
@@ -170,6 +316,8 @@ def evaluate_communication(sender, receiver, data_loader):
                     print("-------------------------")
 
     accuracy = correct_predictions / total_samples if total_samples > 0 else 0
+    sender.train()
+    receiver.train() 
     return accuracy
 
 # --- Main Training Loop ---
@@ -177,12 +325,24 @@ def main():
     parser = argparse.ArgumentParser(description="Train Receiver for discrete communication task using REINFORCE")
     parser.add_argument('--n_a', type=int, default=2, help="Number of attributes")
     parser.add_argument('--n_v', type=int, default=10, help="Number of values per attribute")
-    parser.add_argument('--language', type=str, default='identity', choices=['identity', 'rotated'], help="Type of fixed sender")
+    parser.add_argument('--sender_type', type=str, default='identity', choices=['identity', 'rotated', 'learned'], help="Type of sender")
+    parser.add_argument('--max_len', type=int, default=None, help="Message length (defaults to n_a)")
+
+    # Sender params (only used if sender_type=='learned')
+    parser.add_argument('--sender_emb', type=int, default=50, help='Size of the embeddings of Sender')
+    parser.add_argument('--sender_hidden', type=int, default=100, help='Size of the hidden layer of Sender')
+    parser.add_argument('--sender_cell', type=str, default='gru', choices=['rnn', 'gru', 'lstm'], help='RNN cell type for Sender')
+    parser.add_argument("--sender_lr", type=float, default=0.001, help="Sender learning rate")
+    parser.add_argument("--sender_entropy_coef", type=float, default=0.1, help="Entropy coefficient for Sender")
+
+    # Receiver params
     parser.add_argument('--receiver_emb', type=int, default=50, help='Size of the embeddings of Receiver')
     parser.add_argument('--receiver_hidden', type=int, default=100, help='Size of the hidden layer of Receiver')
     parser.add_argument('--receiver_cell', type=str, default='gru', choices=['rnn', 'gru', 'lstm'], help='RNN cell type for Receiver')
-    parser.add_argument("--lr", type=float, default=0.001, help="Receiver learning rate")
-    parser.add_argument("--entropy-coef", type=float, default=0.05, help="Entropy coefficient for Receiver")
+    parser.add_argument("--receiver_lr", type=float, default=0.001, help="Receiver learning rate")
+    parser.add_argument("--receiver_entropy_coef", type=float, default=0.1, help="Entropy coefficient for Receiver")
+
+    # General training params
     parser.add_argument("--num-steps", type=int, default=10000, help="Total training steps (batches)")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--eval-interval", type=int, default=1000, help="Evaluate every N steps")
@@ -191,6 +351,11 @@ def main():
     parser.add_argument("--grad-norm", type=float, default=1.0, help="Gradient clipping norm value")
 
     args = parser.parse_args()
+
+    # Set max_len default if not provided
+    if args.max_len is None:
+        args.max_len = args.n_a
+        print(f"Message max_len not specified, defaulting to n_a: {args.max_len}")
 
     log_dir = args.log_dir
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
@@ -203,36 +368,55 @@ def main():
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
     print(f'# Train samples: {len(train_data)}, Test samples: {len(test_data)}')
 
-    if args.language == 'identity':
-        sender = IdentitySender(args.n_a, args.n_v).to(device)
-    elif args.language == 'rotated':
-        sender = RotatedSender(args.n_a, args.n_v).to(device)
-    else:
-        raise ValueError(f"Unknown language type: {args.language}")
-    sender.eval()
-
+    # Vocab size needs to accommodate symbols 1..n_v and potentially 0 for SOS/PAD
     vocab_size = args.n_v + 1
+
+    # --- Initialize Sender ---
+    sender_optimizer = None
+    train_sender_flag = (args.sender_type == 'learned') # Flag to control sender training
+    if args.sender_type == 'identity':
+        sender = IdentitySender(args.n_a, args.n_v).to(device)
+        sender.eval() # Fixed senders don't train
+    elif args.sender_type == 'rotated':
+        sender = RotatedSender(args.n_a, args.n_v).to(device)
+        sender.eval() # Fixed senders don't train
+    elif args.sender_type == 'learned':
+        sender = RnnSender(
+            n_attributes=args.n_a,
+            n_values=args.n_v,
+            vocab_size=vocab_size,
+            embed_dim=args.sender_emb,
+            hidden_size=args.sender_hidden,
+            cell=args.sender_cell,
+            max_len=args.max_len
+        ).to(device)
+        sender_optimizer = optim.Adam(sender.parameters(), lr=args.sender_lr)
+        print(f"Sender params (learned): {sum(p.numel() for p in sender.parameters() if p.requires_grad)}")
+    else:
+        raise ValueError(f"Unknown sender type: {args.sender_type}")
+
+    # --- Initialize Receiver ---
     receiver = RnnReceiver(
         n_attributes=args.n_a,
         n_values=args.n_v,
-        vocab_size=vocab_size,
+        vocab_size=vocab_size, # Receiver needs same vocab size
         embed_dim=args.receiver_emb,
         hidden_size=args.receiver_hidden,
         cell=args.receiver_cell
     ).to(device)
-
-    optimizer = optim.Adam(receiver.parameters(), lr=args.lr)
+    receiver_optimizer = optim.Adam(receiver.parameters(), lr=args.receiver_lr)
 
     print("Starting training...")
-    print(f"Sender: {args.language}")
+    print(f"Sender type: {args.sender_type}")
     print(f"Receiver params: {sum(p.numel() for p in receiver.parameters() if p.requires_grad)}")
-    print("Using REINFORCE to train Receiver.")
+    print(f"Using REINFORCE to train {'Receiver and Sender' if train_sender_flag else 'Receiver'}.")
 
     train_iterator = iter(train_loader)
+    sender_loss_hist, sender_pol_loss_hist, sender_ent_loss_hist = [], [], []
+    receiver_loss_hist, receiver_pol_loss_hist, receiver_ent_loss_hist = [], [], []
+    reward_hist = []
 
     for step in range(1, args.num_steps + 1):
-        receiver.train()
-
         try:
             batch = next(train_iterator)
         except StopIteration:
@@ -241,43 +425,117 @@ def main():
 
         input_attributes, _ = batch
         input_attributes = input_attributes.to(device)
-        target_attributes = input_attributes
+        target_attributes = input_attributes # Receiver's target is the original input
 
-        messages, _, _ = sender(input_attributes)
+        # --- Interaction: Sample Receiver Actions ---
+        # Generate message to feed to receiver for action sampling.
+        # Ensure correct sender mode for this temporary generation.
+        if not train_sender_flag:
+            sender.eval()
+            with torch.no_grad():
+                 messages_for_sampling, _, _ = sender(input_attributes)
+        else:
+            sender.train() # Need train mode if sender is learned, even for sampling pass
+            # with torch.no_grad(): # Still no grads needed for sampling itself
+            messages_for_sampling, _, _ = sender(input_attributes)
 
-        prediction_logits = receiver(messages)
+        # Receiver processes message and samples actions
+        receiver.eval() # Use eval mode for sampling actions
+        with torch.no_grad(): # No grads needed for sampling actions
+            prediction_logits = receiver(messages_for_sampling)
+            # Sample receiver actions for REINFORCE
+            receiver_actions = []
+            for i in range(receiver.n_attributes):
+                dist = Categorical(logits=prediction_logits[i])
+                action = dist.sample() # (batch_size,)
+                receiver_actions.append(action)
+            receiver_actions_tensor = torch.stack(receiver_actions, dim=1) # (batch_size, n_attributes)
 
-        receiver_actions = []
-        for i in range(receiver.n_attributes):
-            dist = Categorical(logits=prediction_logits[i])
-            action = dist.sample()
-            receiver_actions.append(action)
-        receiver_actions_tensor = torch.stack(receiver_actions, dim=1)
-
+        # --- Calculate Reward ---
         matches = torch.all(receiver_actions_tensor == target_attributes, dim=1)
-        rewards = matches.float().to(device)
+        rewards = matches.float().to(device) # (batch_size,)
 
-        loss, policy_loss, entropy_loss = train_receiver(
-            receiver, optimizer, messages, target_attributes, receiver_actions_tensor, rewards, args.entropy_coef
+        # --- Training Step (includes message generation) ---
+        rec_loss, rec_pol_loss, rec_ent_loss, \
+        send_loss, send_pol_loss, send_ent_loss, \
+        messages, sender_log_probs, sender_entropies = train_step(
+            sender=sender,
+            receiver=receiver,
+            sender_optimizer=sender_optimizer,
+            receiver_optimizer=receiver_optimizer,
+            input_attributes=input_attributes,
+            receiver_actions_tensor=receiver_actions_tensor,
+            rewards=rewards.detach(),
+            sender_entropy_coef=args.sender_entropy_coef,
+            receiver_entropy_coef=args.receiver_entropy_coef,
+            grad_norm=args.grad_norm,
+            train_sender_flag=train_sender_flag
         )
 
-        if step % 100 == 0:
-            avg_reward = rewards.mean().item()
-            print(f"Step {step}/{args.num_steps}, Avg Reward: {avg_reward:.4f}, Loss: {loss:.4f} (Policy: {policy_loss:.4f}, Entropy: {entropy_loss:.4f})")
+        # Store losses
+        receiver_loss_hist.append(rec_loss)
+        receiver_pol_loss_hist.append(rec_pol_loss)
+        receiver_ent_loss_hist.append(rec_ent_loss)
+        sender_loss_hist.append(send_loss)
+        sender_pol_loss_hist.append(send_pol_loss)
+        sender_ent_loss_hist.append(send_ent_loss)
+        reward_hist.append(rewards.mean().item())
 
+        # --- Logging ---
+        if step % 100 == 0:
+            avg_reward = torch.tensor(reward_hist[-100:]).mean().item()
+            avg_rec_loss = torch.tensor(receiver_loss_hist[-100:]).mean().item()
+            avg_rec_pol = torch.tensor(receiver_pol_loss_hist[-100:]).mean().item()
+            avg_rec_ent = torch.tensor(receiver_ent_loss_hist[-100:]).mean().item()
+
+            log_msg = (f"Step {step}/{args.num_steps}, Avg Reward: {avg_reward:.4f}, "
+                       f"Rec Loss: {avg_rec_loss:.4f} (Pol: {avg_rec_pol:.4f}, Ent: {avg_rec_ent:.4f})")
+
+        sender_ent_loss_hist.append(send_ent_loss)
+        reward_hist.append(rewards.mean().item()) # Store raw reward mean
+
+        # --- Logging ---
+        if step % 100 == 0:
+            avg_reward = torch.tensor(reward_hist[-100:]).mean().item()
+            avg_rec_loss = torch.tensor(receiver_loss_hist[-100:]).mean().item()
+            avg_rec_pol = torch.tensor(receiver_pol_loss_hist[-100:]).mean().item()
+            avg_rec_ent = torch.tensor(receiver_ent_loss_hist[-100:]).mean().item()
+
+            log_msg = (f"Step {step}/{args.num_steps}, Avg Reward: {avg_reward:.4f}, "
+                       f"Rec Loss: {avg_rec_loss:.4f} (Pol: {avg_rec_pol:.4f}, Ent: {avg_rec_ent:.4f})")
+
+            if train_sender_flag:
+                avg_send_loss = torch.tensor(sender_loss_hist[-100:]).mean().item()
+                avg_send_pol = torch.tensor(sender_pol_loss_hist[-100:]).mean().item()
+                avg_send_ent = torch.tensor(sender_ent_loss_hist[-100:]).mean().item()
+                log_msg += (f", Send Loss: {avg_send_loss:.4f} (Pol: {avg_send_pol:.4f}, Ent: {avg_send_ent:.4f})")
+
+            print(log_msg)
+
+        # --- Evaluation ---
         if step % args.eval_interval == 0:
+            # Ensure models are in eval mode for evaluation
+            sender.eval()
             receiver.eval()
             accuracy = evaluate_communication(sender, receiver, test_loader)
             print(f"--- Step {step} Evaluation Accuracy: {accuracy:.4f} ---")
+            # Restore train mode after evaluation (will be set correctly at start of next loop iter)
 
+
+        # --- Checkpointing ---
         if step % args.checkpoint_interval == 0 or step == args.num_steps:
-            checkpoint_path = os.path.join(checkpoint_dir, f"receiver_step_{step}.pt")
-            torch.save({
+            save_obj = {
                 'step': step,
                 'receiver_state_dict': receiver.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'receiver_optimizer_state_dict': receiver_optimizer.state_dict(),
                 'args': args
-            }, checkpoint_path)
+            }
+            if train_sender_flag and sender_optimizer is not None: # Check optimizer exists
+                save_obj['sender_state_dict'] = sender.state_dict()
+                save_obj['sender_optimizer_state_dict'] = sender_optimizer.state_dict()
+
+            checkpoint_path = os.path.join(checkpoint_dir, f"agent_step_{step}.pt") # More general name
+            torch.save(save_obj, checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
 
     print("Training completed!")
