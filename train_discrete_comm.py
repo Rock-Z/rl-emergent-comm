@@ -3,12 +3,12 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F # Added import
 from torch.distributions import Categorical
 from torch.utils.data import DataLoader
 
 # Reuse components from compositional_efficiency
 from compositional_efficiency.dataset import AttributeValueData
-from compositional_efficiency.archs import Receiver as CoreReceiver # Renamed to avoid clash
 from compositional_efficiency.archs import IdentitySender, RotatedSender
 
 # Device setup
@@ -26,10 +26,8 @@ class RnnReceiver(nn.Module):
         self.n_attributes = n_attributes
         self.n_values = n_values
         self.hidden_size = hidden_size
-        # Vocab size needs to include 0 (EOS) and symbols 1 to n_values
         self.vocab_size = vocab_size
 
-        # Embedding layer assumes message symbols are integers from 0 to vocab_size-1
         self.embedding = nn.Embedding(vocab_size, embed_dim)
 
         rnn_cell_type = nn.GRU if cell.lower() == 'gru' else \
@@ -37,9 +35,7 @@ class RnnReceiver(nn.Module):
                         nn.RNN
         self.rnn = rnn_cell_type(embed_dim, hidden_size, batch_first=True)
 
-        # Using the Receiver from archs.py as the output layer
-        # It expects final hidden state and outputs n_a * n_v logits
-        self.output_module = CoreReceiver(n_hidden=hidden_size, n_dim=n_attributes * n_values)
+        self.output_module = nn.Linear(hidden_size, n_attributes * n_values)
 
     def forward(self, message):
         """
@@ -48,7 +44,6 @@ class RnnReceiver(nn.Module):
         Output prediction_logits: List of tensors, one per attribute head.
                                   Each tensor shape: (batch_size, n_values)
         """
-        # message shape: (batch_size, n_attributes)
         batch_size = message.shape[0]
 
         # Ensure message symbols are within embedding range [0, vocab_size-1]
@@ -68,9 +63,8 @@ class RnnReceiver(nn.Module):
         # rnn_out: (batch_size, n_attributes, hidden_size)
         # last_hidden: (batch_size, hidden_size)
 
-        # Pass final hidden state to the output module from archs.py
-        # The CoreReceiver expects two arguments (x, _), pass None for the second one.
-        output_flat = self.output_module(last_hidden, None) # (batch_size, n_a * n_v)
+        # Pass final hidden state to the output linear layer
+        output_flat = self.output_module(last_hidden) # (batch_size, n_a * n_v)
 
         # Reshape output to have separate logits for each attribute
         output_logits_per_attribute = output_flat.view(batch_size, self.n_attributes, self.n_values)
@@ -90,10 +84,8 @@ def train_receiver(receiver, optimizer, messages, target_attributes, receiver_ac
     receiver_actions: (batch_size, n_attributes) - The attributes predicted by the receiver (sampled)
     rewards: (batch_size,) - Scalar reward (1 if all attributes match, 0 otherwise)
     """
-    # batch_size = messages.shape[0] # Unused
-
     # Forward pass to get current action probabilities
-    prediction_logits = receiver(messages) # List of [ (batch_size, n_values), ... ]
+    prediction_logits = receiver(messages)
 
     log_probs = []
     entropies = []
@@ -127,7 +119,6 @@ def train_receiver(receiver, optimizer, messages, target_attributes, receiver_ac
     # Optimize Receiver
     optimizer.zero_grad()
     loss.backward()
-    # Optional: Gradient Clipping
     torch.nn.utils.clip_grad_norm_(receiver.parameters(), max_norm=1.0)
     optimizer.step()
 
@@ -145,19 +136,19 @@ def evaluate_communication(sender, receiver, data_loader):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(data_loader):
-            input_attributes, _ = batch # Data loader gives (attributes, attributes)
+            input_attributes, _ = batch
             input_attributes = input_attributes.to(device)
             batch_size = input_attributes.shape[0]
 
-            messages, _, _ = sender(input_attributes) # Unpack the tuple
-            prediction_logits = receiver(messages) # List of [ (batch_size, n_values), ... ]
+            messages, _, _ = sender(input_attributes)
+            prediction_logits = receiver(messages)
 
             # Get receiver predictions (argmax for evaluation)
             predictions = []
             for i in range(receiver.n_attributes):
                 pred = torch.argmax(prediction_logits[i], dim=1)
                 predictions.append(pred)
-            receiver_output = torch.stack(predictions, dim=1) # (batch_size, n_attributes)
+            receiver_output = torch.stack(predictions, dim=1)
 
             # Compare with original input attributes
             matches = torch.all(receiver_output == input_attributes, dim=1)
@@ -179,32 +170,25 @@ def evaluate_communication(sender, receiver, data_loader):
                     print("-------------------------")
 
     accuracy = correct_predictions / total_samples if total_samples > 0 else 0
-    # No need to set back to train mode, done outside if needed
     return accuracy
 
 # --- Main Training Loop ---
 def main():
     parser = argparse.ArgumentParser(description="Train Receiver for discrete communication task using REINFORCE")
-    # Data params from discrete.py
     parser.add_argument('--n_a', type=int, default=2, help="Number of attributes")
     parser.add_argument('--n_v', type=int, default=10, help="Number of values per attribute")
-    # Sender params from discrete.py
     parser.add_argument('--language', type=str, default='identity', choices=['identity', 'rotated'], help="Type of fixed sender")
-    # Receiver params from discrete.py (and RnnReceiver wrapper)
     parser.add_argument('--receiver_emb', type=int, default=50, help='Size of the embeddings of Receiver')
     parser.add_argument('--receiver_hidden', type=int, default=100, help='Size of the hidden layer of Receiver')
     parser.add_argument('--receiver_cell', type=str, default='gru', choices=['rnn', 'gru', 'lstm'], help='RNN cell type for Receiver')
-    # Training params
     parser.add_argument("--lr", type=float, default=0.001, help="Receiver learning rate")
-    parser.add_argument("--entropy-coef", type=float, default=0.05, help="Entropy coefficient for Receiver") # Adjusted default based on discrete.py
-    parser.add_argument("--num-steps", type=int, default=50000, help="Total training steps (batches)")
-    parser.add_argument("--batch-size", type=int, default=512, help="Batch size") # Adjusted default based on discrete.py examples
-    # Logging/Saving params
+    parser.add_argument("--entropy-coef", type=float, default=0.05, help="Entropy coefficient for Receiver")
+    parser.add_argument("--num-steps", type=int, default=10000, help="Total training steps (batches)")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--eval-interval", type=int, default=1000, help="Evaluate every N steps")
     parser.add_argument("--checkpoint-interval", type=int, default=5000, help="Save checkpoint every N steps")
     parser.add_argument("--log-dir", type=str, default="./comm_logs_reinforce/", help="Directory for logs and checkpoints")
     parser.add_argument("--grad-norm", type=float, default=1.0, help="Gradient clipping norm value")
-
 
     args = parser.parse_args()
 
@@ -212,28 +196,21 @@ def main():
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # --- Data ---
     train_data = AttributeValueData(n_attributes=args.n_a, n_values=args.n_v, mul=1, mode='train')
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0) # num_workers=0 for simplicity
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
     test_data = AttributeValueData(n_attributes=args.n_a, n_values=args.n_v, mul=1, mode='test')
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
     print(f'# Train samples: {len(train_data)}, Test samples: {len(test_data)}')
 
-    # --- Models ---
-    # Sender (Fixed)
     if args.language == 'identity':
         sender = IdentitySender(args.n_a, args.n_v).to(device)
     elif args.language == 'rotated':
         sender = RotatedSender(args.n_a, args.n_v).to(device)
     else:
         raise ValueError(f"Unknown language type: {args.language}")
-    sender.eval() # Ensure sender is in eval mode and not trained
+    sender.eval()
 
-    # Receiver (Trainable)
-    # Vocab size for receiver embedding must match the range of symbols sent by the sender.
-    # Sender outputs symbols in the range [1, n_v].
-    # Receiver embedding needs size n_v + 1 to handle symbols 0 (EOS) to n_v.
     vocab_size = args.n_v + 1
     receiver = RnnReceiver(
         n_attributes=args.n_a,
@@ -244,7 +221,6 @@ def main():
         cell=args.receiver_cell
     ).to(device)
 
-    # Optimizer for the Receiver ONLY
     optimizer = optim.Adam(receiver.parameters(), lr=args.lr)
 
     print("Starting training...")
@@ -255,61 +231,47 @@ def main():
     train_iterator = iter(train_loader)
 
     for step in range(1, args.num_steps + 1):
-        receiver.train() # Ensure receiver is in train mode
+        receiver.train()
 
-        # Get next batch, looping indefinitely
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_loader)
             batch = next(train_iterator)
 
-        input_attributes, _ = batch # Data is (attributes, attributes)
+        input_attributes, _ = batch
         input_attributes = input_attributes.to(device)
-        target_attributes = input_attributes # Target is the same as input
+        target_attributes = input_attributes
 
-        # --- Interaction Phase (using current receiver policy) ---
-        messages, _, _ = sender(input_attributes) # Unpack the tuple, keep only the message
+        messages, _, _ = sender(input_attributes)
 
-        # Receiver makes prediction (action) by sampling
-        prediction_logits = receiver(messages) # List of [ (batch_size, n_values), ... ]
+        prediction_logits = receiver(messages)
 
-        # Sample actions from receiver's policy
         receiver_actions = []
-        # No grad needed here as sampling itself isn't differentiated through
-        # Gradients will flow back from the log_probs in the train function
         for i in range(receiver.n_attributes):
             dist = Categorical(logits=prediction_logits[i])
-            action = dist.sample() # Sample action for this attribute
+            action = dist.sample()
             receiver_actions.append(action)
-        receiver_actions_tensor = torch.stack(receiver_actions, dim=1) # (batch_size, n_attributes)
+        receiver_actions_tensor = torch.stack(receiver_actions, dim=1)
 
-        # Calculate Rewards (Communication Success)
-        # Reward is 1 if all attributes match, 0 otherwise
         matches = torch.all(receiver_actions_tensor == target_attributes, dim=1)
-        rewards = matches.float().to(device) # (batch_size,)
+        rewards = matches.float().to(device)
 
-        # --- Training Phase (Update Receiver) ---
         loss, policy_loss, entropy_loss = train_receiver(
             receiver, optimizer, messages, target_attributes, receiver_actions_tensor, rewards, args.entropy_coef
         )
 
-        # --- Logging ---
         if step % 100 == 0:
-            avg_reward = rewards.mean().item() # Average reward in the current batch
+            avg_reward = rewards.mean().item()
             print(f"Step {step}/{args.num_steps}, Avg Reward: {avg_reward:.4f}, Loss: {loss:.4f} (Policy: {policy_loss:.4f}, Entropy: {entropy_loss:.4f})")
 
-        # --- Evaluation ---
         if step % args.eval_interval == 0:
-            receiver.eval() # Set receiver to eval mode for evaluation
+            receiver.eval()
             accuracy = evaluate_communication(sender, receiver, test_loader)
             print(f"--- Step {step} Evaluation Accuracy: {accuracy:.4f} ---")
-            # receiver.train() # Set back to train mode in the next loop iteration
 
-        # --- Checkpointing ---
         if step % args.checkpoint_interval == 0 or step == args.num_steps:
             checkpoint_path = os.path.join(checkpoint_dir, f"receiver_step_{step}.pt")
-            # Save only receiver state, as sender is fixed
             torch.save({
                 'step': step,
                 'receiver_state_dict': receiver.state_dict(),
