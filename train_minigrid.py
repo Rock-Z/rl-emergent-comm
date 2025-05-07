@@ -6,64 +6,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
+from tqdm import tqdm 
+import csv
+from datetime import datetime
 
 import gymnasium as gym
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
-from gymnasium.wrappers import RecordVideo
-import minigrid
-from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
-from minigrid.core.grid import Grid
-from minigrid.core.mission import MissionSpace
-from minigrid.core.world_object import Goal
-from minigrid.minigrid_env import MiniGridEnv
+from gymnasium.wrappers.record_video import RecordVideo # Corrected import
+from minigrid.wrappers import RGBImgPartialObsWrapper # ImgObsWrapper removed
+
+from custom_minigrid_env import EmptyEnvRandom10x10
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class EmptyEnvRandom10x10(MiniGridEnv):
-    """
-    Empty 10x10 grid environment with a random goal location and fixed agent start.
-    """
-    def __init__(self, size=10, **kwargs):
-        # Agent always starts at (1, 1) facing right (direction 0)
-        self.agent_start_pos = (1, 1)
-        self.agent_start_dir = 0
-        mission_space = MissionSpace(mission_func=lambda: "get to the green goal square")
-        super().__init__(
-            mission_space=mission_space,
-            width=size,
-            height=size,
-            max_steps=4 * size * size,
-            **kwargs,
-        )
-
-    def _gen_grid(self, width, height):
-        # Create an empty grid
-        self.grid = Grid(width, height)
-
-        # Generate the surrounding walls
-        self.grid.wall_rect(0, 0, width, height)
-
-        # Place the agent at the fixed starting position
-        self.agent_pos = self.agent_start_pos
-        self.agent_dir = self.agent_start_dir
-
-        # Place a goal square randomly within the grid, excluding walls and agent start
-        self.place_obj(Goal(), top=(1,1), size=(width-2, height-2))
-
-        self.mission = "get to the green goal square"
-
-# Register the custom environment
-gym.register(
-    id="MiniGrid-Empty-Random-10x10-v0",
-    entry_point="train_minigrid:EmptyEnvRandom10x10", # Ensure this matches the script name if run directly
-)
 
 def make_env(video_folder=None, episode_trigger=None):
     # Initialize environment with rgb_array render_mode for video recording
     env = gym.make("MiniGrid-Empty-Random-10x10-v0", render_mode="rgb_array")
     if video_folder:
-        env = RecordVideo(env, video_folder=video_folder, episode_trigger=episode_trigger, name_prefix="gameplay")
-    #env = RGBImgPartialObsWrapper(env, tile_size=8) # Get RGB image obs
+        # Ensure episode_trigger is callable if not None
+        trigger = episode_trigger if callable(episode_trigger) else (lambda x: x == 0)
+        env = RecordVideo(env, video_folder=video_folder, episode_trigger=trigger, name_prefix="gameplay")
+    env = RGBImgPartialObsWrapper(env, tile_size=8) # Get RGB image obs
     env = RecordEpisodeStatistics(env) # Records episode statistics
     return env
 
@@ -80,6 +43,8 @@ class RNNAgent(nn.Module):
             nn.Conv2d(3, 32, kernel_size=3, stride=2),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2),
             nn.ReLU(),
             nn.Flatten()
         )
@@ -212,20 +177,21 @@ def run_recorded_episode(agent, video_folder, episode_num):
         with torch.no_grad():
             # Agent takes dictionary input
             policy, _ = agent(obs_input)
+            # action = policy.argmax(dim=-1)  # Use argmax for deterministic action selection
             dist = Categorical(policy)
             action = dist.sample()
         
         next_state_dict, reward, terminated, truncated, _ = rec_env.step(action.item())
         done = terminated or truncated
         state_dict = next_state_dict
-        episode_reward += reward
+        episode_reward += float(reward) # Cast reward to float
 
     rec_env.close()
     print(f"Finished recording episode {episode_num}. Reward: {episode_reward:.2f}")
 
 def main():
     parser = argparse.ArgumentParser(description="RNN Policy Gradient for MiniGrid")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.00002, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.9, help="Discount factor")
     parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy coefficient")
     parser.add_argument("--num-episodes", type=int, default=10000, help="Number of episodes")
@@ -234,6 +200,7 @@ def main():
     
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("videos", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
     
     env = make_env()
     
@@ -247,73 +214,122 @@ def main():
     total_steps = 0
     episode_rewards = []
     
-    for episode in range(1, args.num_episodes + 1):
-        state_dict, _ = env.reset() # Now returns a dictionary
-        agent.reset_hidden()
-        
-        done = False
-        episode_reward = 0.0
-        
-        states_dicts = [] # Store state dictionaries
-        actions = []
-        rewards = []
-        values = []
-        masks = []
-        
-        while not done:
-            # Prepare dictionary input for agent
-            img_tensor = torch.FloatTensor(state_dict['image']).unsqueeze(0).to(device)
-            dir_tensor = torch.tensor([state_dict['direction']], dtype=torch.long, device=device)
-            obs_input = {'image': img_tensor, 'direction': dir_tensor}
+    # Store all episode data for logging
+    episode_logs = []
+    
+    # Wrap the episode loop with tqdm
+    with tqdm(range(1, args.num_episodes + 1), desc="Training Progress") as pbar:
+        for episode in pbar:
+            state_dict, _ = env.reset() # Now returns a dictionary
+            agent.reset_hidden()
+            
+            done = False
+            episode_reward = 0.0
+            
+            states_dicts = [] # Store state dictionaries
+            actions = []
+            rewards = []
+            values = []
+            masks = []
+            
+            while not done:
+                # Prepare dictionary input for agent
+                img_tensor = torch.FloatTensor(state_dict['image']).unsqueeze(0).to(device)
+                dir_tensor = torch.tensor([state_dict['direction']], dtype=torch.long, device=device)
+                obs_input = {'image': img_tensor, 'direction': dir_tensor}
 
-            with torch.no_grad():
-                # Agent takes dictionary input
-                policy, value = agent(obs_input)
-                dist = Categorical(policy)
-                action = dist.sample()
+                with torch.no_grad():
+                    # Agent takes dictionary input
+                    policy, value = agent(obs_input)
+                    dist = Categorical(policy)
+                    action = dist.sample()
+                
+                next_state_dict, reward, terminated, truncated, _ = env.step(action.item())
+                done = terminated or truncated
+                
+                # Store the full state dictionary
+                states_dicts.append(state_dict)
+                actions.append(action.item())
+                rewards.append(reward)
+                values.append(value.item())
+                masks.append(1 - done)
+                
+                state_dict = next_state_dict
+                episode_reward += float(reward) # Cast reward to float
+                total_steps += 1
             
-            next_state_dict, reward, terminated, truncated, _ = env.step(action.item())
-            done = terminated or truncated
+            returns = compute_returns(rewards, masks, gamma=args.gamma)
             
-            # Store the full state dictionary
-            states_dicts.append(state_dict)
-            actions.append(action.item())
-            rewards.append(reward)
-            values.append(value.item())
-            masks.append(1 - done)
+            # Pass list of state dictionaries to train function
+            loss = train(agent, optimizer, states_dicts, actions, returns, values, entropy_coef=args.entropy_coef)
             
-            state_dict = next_state_dict
-            episode_reward += reward
-            total_steps += 1
-        
-        returns = compute_returns(rewards, masks, gamma=args.gamma)
-        
-        # Pass list of state dictionaries to train function
-        loss = train(agent, optimizer, states_dicts, actions, returns, values, entropy_coef=args.entropy_coef)
-        
-        episode_rewards.append(episode_reward)
-        
-        if episode % 10 == 0:
-            avg_reward = np.mean(episode_rewards[-10:])
-            print(f"Episode {episode}/{args.num_episodes}, Avg Reward: {avg_reward:.2f}, Loss: {loss:.4f}")
-        
-        if episode % args.checkpoint_interval == 0 or episode == args.num_episodes:
-            # Record a gameplay video
-            video_path = os.path.join("videos", f"episode_{episode}")
-            run_recorded_episode(agent, video_path, episode)
-
-            # Save checkpoint
-            checkpoint_path = os.path.join("checkpoints", f"rnn_agent_episode_{episode}.pt")
-            torch.save({
+            episode_rewards.append(episode_reward)
+            
+            # Store episode data
+            episode_logs.append({
                 'episode': episode,
-                'model_state_dict': agent.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'avg_reward': np.mean(episode_rewards[-10:]),
-                'total_steps': total_steps,
-            }, checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
+                'reward': episode_reward,
+                'loss': loss,
+                'avg_reward_last_10': np.mean(episode_rewards[-10:]),
+                'steps': len(states_dicts),
+                'total_steps': total_steps
+            })
+            
+            # Update tqdm progress bar description with loss
+            pbar.set_description(f"Episode {episode}/{args.num_episodes}, Avg Reward: {np.mean(episode_rewards[-10:]):.2f}, Loss: {loss:.4f}")
+            
+            if episode % 50 == 0:
+                # The print statement can be removed or kept for logging alongside tqdm
+                # print(f"Episode {episode}/{args.num_episodes}, Avg Reward: {avg_reward:.2f}, Loss: {loss:.4f}")
+                pass # tqdm now handles this output via set_description
+            
+            if episode % args.checkpoint_interval == 0 or episode == args.num_episodes:
+                # Record a gameplay video
+                video_path = os.path.join("videos", f"episode_{episode}")
+                run_recorded_episode(agent, video_path, episode)
+
+                # Save checkpoint
+                checkpoint_path = os.path.join("checkpoints", f"rnn_agent_episode_{episode}.pt")
+                torch.save({
+                    'episode': episode,
+                    'model_state_dict': agent.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'avg_reward': np.mean(episode_rewards[-10:]),
+                    'total_steps': total_steps,
+                }, checkpoint_path)
+                print(f"Checkpoint saved to {checkpoint_path}")
     
     env.close()
+    
+    # Save training results to CSV with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_path = f'logs/training_results_{timestamp}.csv'
+    
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        # Write hyperparameters
+        writer.writerow(['Parameter', 'Value'])
+        writer.writerow(['Learning Rate', args.lr])
+        writer.writerow(['Gamma', args.gamma])
+        writer.writerow(['Entropy Coefficient', args.entropy_coef])
+        writer.writerow(['Number of Episodes', args.num_episodes])
+        writer.writerow(['Total Steps', total_steps])
+        writer.writerow(['Final Average Reward', np.mean(episode_rewards[-10:])])
+        writer.writerow([])  # Empty row for separation
+        
+        # Write per-episode data
+        writer.writerow(['Episode', 'Reward', 'Loss', 'Avg Reward (Last 10)', 'Episode Steps', 'Total Steps'])
+        for log in episode_logs:
+            writer.writerow([
+                log['episode'],
+                f"{log['reward']:.4f}",
+                f"{log['loss']:.4f}",
+                f"{log['avg_reward_last_10']:.4f}",
+                log['steps'],
+                log['total_steps']
+            ])
+    
+    print(f"Training results saved to {csv_path}")
     print("Training completed!")
 
 if __name__ == "__main__":

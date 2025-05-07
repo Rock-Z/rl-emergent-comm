@@ -18,7 +18,6 @@ from intervention import Metrics, Evaluator
 
 from egg.core import EarlyStopperAccuracy
 
-
 def get_params(params):
     parser = argparse.ArgumentParser()
     parser.add_argument('--n_attributes', type=int, default=4, help='')

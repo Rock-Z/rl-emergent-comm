@@ -1,0 +1,42 @@
+{"epoch": 67, "positional_disent": 0.26835641264915466, "bag_of_symbol_disent": 0.12010958790779114, "topographic_sim": 0.42405080851983823}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.25}, "epoch": 67}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 36}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 31}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 35}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 97}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 100}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 95}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 139}
+{"generalization hold out": {"acc": 0.9444444179534912, "acc_or": 0.9444444179534912}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 155}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.3125}, "epoch": 146}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 96}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 87}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.0, "acc_or": 0.375}, "epoch": 88}
+---End--
+{"epoch": 3000, "positional_disent": 0.13601750135421753, "bag_of_symbol_disent": 0.2593768239021301, "topographic_sim": 0.50309752515896}
+{"generalization hold out": {"acc": 1.0, "acc_or": 1.0}, "uniform holdout": {"acc": 0.125, "acc_or": 0.5625}, "epoch": 3000}
+---End--
+{"epoch": 3000, "positional_disent": 0.1822671890258789, "bag_of_symbol_disent": 0.0664251297712326, "topographic_sim": 0.21867523044268364}
+{"generalization hold out": {"acc": 0.8793103694915771, "acc_or": 0.8793103694915771}, "uniform holdout": {"acc": 0.0595238097012043, "acc_or": 0.4345238208770752}, "epoch": 3000}
+---End--
+{"epoch": 59, "positional_disent": 0.24583758413791656, "bag_of_symbol_disent": 0.06966213136911392, "topographic_sim": 0.39262400376514334}
+{"generalization hold out": {"acc": 0.9176955223083496, "acc_or": 0.9567901492118835}, "uniform holdout": {"acc": 0.5416666865348816, "acc_or": 0.819444477558136}, "epoch": 59}
+{"generalization hold out": {"acc": 0.905349850654602, "acc_or": 0.9526749849319458}, "uniform holdout": {"acc": 0.4861111044883728, "acc_or": 0.7870370149612427}, "epoch": 15}
+{"generalization hold out": {"acc": 0.9135802984237671, "acc_or": 0.9567901492118835}, "uniform holdout": {"acc": 0.5, "acc_or": 0.7962962985038757}, "epoch": 13}
+{"generalization hold out": {"acc": 0.9094650745391846, "acc_or": 0.9547325968742371}, "uniform holdout": {"acc": 0.4305555522441864, "acc_or": 0.7685185074806213}, "epoch": 12}
+{"generalization hold out": {"acc": 0.9135802984237671, "acc_or": 0.9547325372695923}, "uniform holdout": {"acc": 0.6111111044883728, "acc_or": 0.8333333134651184}, "epoch": 45}
+{"generalization hold out": {"acc": 0.9176955223083496, "acc_or": 0.9547325968742371}, "uniform holdout": {"acc": 0.5972222089767456, "acc_or": 0.8240740895271301}, "epoch": 46}
+{"generalization hold out": {"acc": 0.9218107461929321, "acc_or": 0.9588477611541748}, "uniform holdout": {"acc": 0.6111111044883728, "acc_or": 0.8287037014961243}, "epoch": 47}
+{"generalization hold out": {"acc": 0.8559671640396118, "acc_or": 0.9279836416244507}, "uniform holdout": {"acc": 0.347222238779068, "acc_or": 0.7129629850387573}, "epoch": 65}
+{"generalization hold out": {"acc": 0.888888955116272, "acc_or": 0.9403292536735535}, "uniform holdout": {"acc": 0.4861111044883728, "acc_or": 0.7731481790542603}, "epoch": 57}
+{"generalization hold out": {"acc": 0.8436214327812195, "acc_or": 0.9197530746459961}, "uniform holdout": {"acc": 0.4861111044883728, "acc_or": 0.7731481790542603}, "epoch": 49}
+{"generalization hold out": {"acc": 0.888888955116272, "acc_or": 0.9423868656158447}, "uniform holdout": {"acc": 0.5416666865348816, "acc_or": 0.8101851940155029}, "epoch": 35}
+{"generalization hold out": {"acc": 0.8847736716270447, "acc_or": 0.9423868656158447}, "uniform holdout": {"acc": 0.4861111044883728, "acc_or": 0.7916666865348816}, "epoch": 36}
+{"generalization hold out": {"acc": 0.9135802984237671, "acc_or": 0.9567901492118835}, "uniform holdout": {"acc": 0.569444477558136, "acc_or": 0.8287037014961243}, "epoch": 34}
+---End--
+{"epoch": 3000, "positional_disent": 0.42419809103012085, "bag_of_symbol_disent": 0.08521424233913422, "topographic_sim": 0.5032838152701048}
+{"generalization hold out": {"acc": 0.9272977113723755, "acc_or": 0.9741655588150024}, "uniform holdout": {"acc": 0.8216463327407837, "acc_or": 0.9508383870124817}, "epoch": 3000}
+---End--
+{"epoch": 3000, "positional_disent": 0.4874461889266968, "bag_of_symbol_disent": 0.11486458033323288, "topographic_sim": 0.17678293928085628}
+{"generalization hold out": {"acc": 0.7424242496490479, "acc_or": 0.7424242496490479}, "uniform holdout": {"acc": 0.055102039128541946, "acc_or": 0.44387751817703247}, "epoch": 3000}
+---End--
