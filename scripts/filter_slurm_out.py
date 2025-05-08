@@ -3,7 +3,6 @@ import os
 import argparse
 import json
 
-# Regex patterns for the specific JSON structures and '---End--'
 pattern1 = re.compile(r'^\{"epoch":\s*\d+,\s*"positional_disent":.*\}$')
 pattern2 = re.compile(r'^\{"generalization hold out":.*"epoch":\s*\d+\}$')
 pattern_end = re.compile(r'^---End--$')

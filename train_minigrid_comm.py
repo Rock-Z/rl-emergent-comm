@@ -13,6 +13,7 @@ from egg.core import EarlyStopperAccuracy
 
 from train_minigrid import RNNAgent as NavRNNAgentBase
 from train_minigrid import make_env
+from compo_vs_generalization.intervention import Metrics
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -59,7 +60,7 @@ class NavRNNAgent(NavRNNAgentBase):
         conv_out = self.conv(img)
         direction_embedded = self.direction_embedding(obs_dict['direction'])
         combined_features = torch.cat((conv_out, direction_embedded), dim=1)
-        next_hidden_state = self.rnn(combined_features, hidden_state)
+        next_hidden_state = self.rnn(combined_features, hidden_state.clone())
         policy_logits = self.actor(next_hidden_state)
         values = self.critic(next_hidden_state)
         return policy_logits, values.squeeze(-1), next_hidden_state
@@ -107,6 +108,9 @@ class MiniGridNavigationLoss(nn.Module):
         batch_episode_rewards = []
         batch_nav_agent_losses = []
 
+        if self.training and torch.is_grad_enabled():
+            self.nav_agent_optimizer.zero_grad()
+
         for i in range(batch_size):
             env_instance = self.env_factory()
             actual_initial_obs_raw, _ = env_instance.reset()
@@ -136,7 +140,8 @@ class MiniGridNavigationLoss(nn.Module):
                     'direction': torch.tensor([next_obs_raw_dict['direction']], dtype=torch.long).to(device)
                 }
                 current_hidden = next_hidden
-                if done: break
+                if done:
+                    break
             env_instance.close()
 
             returns = []
@@ -156,13 +161,14 @@ class MiniGridNavigationLoss(nn.Module):
             nav_agent_loss = actor_loss + 0.5 * critic_loss + entropy_bonus
             
             if self.training and torch.is_grad_enabled():
-                self.nav_agent_optimizer.zero_grad()
-                nav_agent_loss.backward(retain_graph=True)
-                self.nav_agent_optimizer.step()
+                nav_agent_loss.backward(retain_graph=True) 
             
             cumulative_reward_for_egg_loss[i] = -torch.tensor(sum(ep_rewards), dtype=torch.float, device=device)
             batch_episode_rewards.append(sum(ep_rewards))
             batch_nav_agent_losses.append(nav_agent_loss.item())
+
+        if self.training and torch.is_grad_enabled():
+            self.nav_agent_optimizer.step() 
 
         final_loss_for_egg_framework = cumulative_reward_for_egg_loss
         aux_info = {
@@ -194,7 +200,7 @@ class MiniGridEpisodeDataset(Dataset):
         receiver_input_img = torch.FloatTensor(obs_dict['image'])
         receiver_input_dir = torch.tensor(obs_dict['direction'], dtype=torch.long)
         env.close()
-        labels = torch.zeros(1) # Dummy labels
+        labels = torch.zeros(1)
         return sender_input, labels, {'image': receiver_input_img, 'direction': receiver_input_dir}
 
 def collate_fn_minigrid(batch_list):
@@ -209,7 +215,6 @@ def collate_fn_minigrid(batch_list):
 
 def get_params(params):
     parser = argparse.ArgumentParser()
-    # EGG Core Arguments
     parser.add_argument('--sender_cell', type=str, default='gru', help='Sender RNN cell (rnn, gru, lstm)')
     parser.add_argument('--sender_hidden', type=int, default=64, help='Sender RNN hidden size')
     parser.add_argument('--sender_emb', type=int, default=32, help='Sender embedding dimension')
@@ -218,19 +223,22 @@ def get_params(params):
     parser.add_argument('--episodes_per_epoch', type=int, default=1000, help="Episodes per epoch")
     parser.add_argument('--length_cost', type=float, default=0.0, help="Cost for message length")
 
-    # Navigation Agent Arguments
     parser.add_argument('--nav_agent_hidden_size', type=int, default=64, help='Nav agent RNN hidden size')
     parser.add_argument('--nav_agent_lr', type=float, default=2e-5, help='Nav agent learning rate')
     parser.add_argument('--gamma', type=float, default=0.9, help='Discount factor for navigation')
     parser.add_argument('--nav_entropy_coeff', type=float, default=0.1, help='Nav agent entropy coeff')
     parser.add_argument('--max_episode_steps', type=int, default=400, help='Max steps per MiniGrid episode')
 
-    # Navigation Agent's Message Processor Arguments
     parser.add_argument('--nav_message_embed_dim', type=int, default=32, help='Msg embedding dim in NavAgent')
     parser.add_argument('--nav_message_rnn_hidden', type=int, default=64, help='Msg RNN hidden size in NavAgent')
     parser.add_argument('--nav_message_cell', type=str, default='GRU', help='Msg RNN cell in NavAgent')
     
     parser.add_argument('--no_comm', action='store_true', default=False, help='No-communication mode')
+
+    parser.add_argument('--n_attributes', type=int, default=2, help='Number of attributes for Metrics callback (default 2 for x,y coords)')
+    parser.add_argument('--n_values', type=int, default=1, help='Number of values for each attribute for Metrics callback (default 1 for coords)')
+    parser.add_argument('--stats_freq', type=int, default=1, help='Frequency for logging custom metrics from intervention.Metrics')
+
     args = core.init(arg_parser=parser, params=params)
     return args
 
@@ -283,15 +291,35 @@ def main(params):
 
     dataset = MiniGridEpisodeDataset(env_factory, opts.episodes_per_epoch, grid_size)
     train_loader = DataLoader(dataset, batch_size=opts.batch_size, shuffle=True, collate_fn=collate_fn_minigrid)
+    
     validation_dataset = MiniGridEpisodeDataset(env_factory, opts.batch_size * 2, grid_size)
     validation_loader = DataLoader(validation_dataset, batch_size=opts.batch_size, collate_fn=collate_fn_minigrid)
 
+    metrics_dataset_sender_inputs = []
+    if not opts.no_comm:
+        for i in range(len(validation_dataset)):
+            sender_input, _, _ = validation_dataset[i]
+            metrics_dataset_sender_inputs.append(sender_input)
+    
+    metrics_callback = Metrics(
+        dataset=metrics_dataset_sender_inputs, 
+        device=opts.device, 
+        n_attributes=opts.n_attributes, 
+        n_values=opts.n_values, 
+        vocab_size=opts.vocab_size, 
+        freq=opts.stats_freq
+    )
+
+    callbacks = [
+        core.ConsoleLogger(as_json=True, print_train_loss=True),
+        EarlyStopperAccuracy(threshold=opts.early_stopping_threshold, validation=True, field_name='reward_mean')
+    ]
+    if not opts.no_comm and metrics_dataset_sender_inputs:
+        callbacks.append(metrics_callback)
+
     trainer = core.Trainer(
         game=game, optimizer=optimizer, train_data=train_loader, validation_data=validation_loader,
-        callbacks=[
-            core.ConsoleLogger(as_json=True, print_train_loss=True),
-            EarlyStopperAccuracy(threshold=opts.early_stopping_threshold, validation=True, field_name='reward_mean')
-        ]
+        callbacks=callbacks
     )
 
     print("Starting EGG training...")
